@@ -280,7 +280,7 @@ func routeModel(raw []byte) ([]byte, error) {
 		}
 		entry = routeCacheEntryFromDecision(localDecision, "")
 	}
-	storeRoute(cfg, req.ModelRouteRequest, entry)
+	storeRoute(full, cfg, req.ModelRouteRequest, entry)
 	logRouteDecision(cfg, req.ModelRouteRequest, entry, "selected", trace, dTrace)
 	return routeResponse(entry, cfg, req.ModelRouteRequest)
 }
@@ -568,13 +568,19 @@ func sessionRoute(cfg domain.Config, req infrastructure.ModelRouteRequest) (infr
 	sessionID := metadataString(req.Metadata, "execution_session_id")
 	// Namespace sessions per virtual model: the same session may use different
 	// virtual models for different turns, and each entry keeps its own pin.
-	// Sessions pinned before multi-virtual-model namespacing use the bare
-	// session id; keep reading them so pins survive upgrade (one lookup only,
-	// new pins always use the namespaced key).
-	if entry, ok := runtimeState.GetSessionRoute(cfg.VirtualModel + "\x00" + sessionID); ok {
+	// A pin stored before multi-virtual-model namespacing (bare session id) is
+	// migrated to the namespaced key on first hit and deleted, so it routes
+	// exactly one legacy request instead of every entry indefinitely.
+	namespaced := cfg.VirtualModel + "\x00" + sessionID
+	if entry, ok := runtimeState.GetSessionRoute(namespaced); ok {
 		return entry, true
 	}
-	return runtimeState.GetSessionRoute(sessionID)
+	if entry, ok := runtimeState.GetSessionRoute(sessionID); ok {
+		runtimeState.SetSessionRoute(namespaced, entry)
+		runtimeState.DeleteSessionRoute(sessionID)
+		return entry, true
+	}
+	return infrastructure.RouteCacheEntry{}, false
 }
 
 func cachedRoute(cfg domain.Config, req infrastructure.ModelRouteRequest) (infrastructure.RouteCacheEntry, bool) {
@@ -584,9 +590,11 @@ func cachedRoute(cfg domain.Config, req infrastructure.ModelRouteRequest) (infra
 	return runtimeState.GetCachedRoute(routeCacheKey(req), cacheTTL(cfg))
 }
 
-func storeRoute(cfg domain.Config, req infrastructure.ModelRouteRequest, entry infrastructure.RouteCacheEntry) {
+func storeRoute(full, cfg domain.Config, req infrastructure.ModelRouteRequest, entry infrastructure.RouteCacheEntry) {
 	if cfg.Cache.Enabled {
-		runtimeState.SetCachedRoute(routeCacheKey(req), entry, cfg.Cache.MaxEntries)
+		// The cache map is shared across entries, so capacity uses the
+		// largest max_entries among cache-enabled entries.
+		runtimeState.SetCachedRoute(routeCacheKey(req), entry, full.EffectiveCacheMaxEntries())
 	}
 	if cfg.Routing.KeepSameModelPerSession {
 		// Same namespace as sessionRoute: one pin per virtual model per session.
@@ -1002,6 +1010,17 @@ func managementHandle(raw []byte) ([]byte, error) {
 	})
 }
 
+// anyEntryExecutorFallback reports whether any virtual_models entry enables
+// the non-streaming same-request fallback executor.
+func anyEntryExecutorFallback(cfg domain.Config) bool {
+	for _, entry := range cfg.ResolveEntries() {
+		if entry.ExecutorFallback.Enabled {
+			return true
+		}
+	}
+	return false
+}
+
 func pluginRegistration() registration {
 	cfg := configStore.Load()
 	capabilities := registrationCapability{
@@ -1010,7 +1029,10 @@ func pluginRegistration() registration {
 		UsagePlugin:    true,
 		ManagementAPI:  true,
 	}
-	if cfg.ExecutorFallback.Enabled {
+	// Executor is registered when the top level or any virtual_models entry
+	// enables fallback. Otherwise an entry-scoped `TargetKind: self` response
+	// would be rejected by the host because no executor was registered.
+	if cfg.ExecutorFallback.Enabled || anyEntryExecutorFallback(cfg) {
 		capabilities.Executor = true
 		capabilities.ExecutorModelScope = "static"
 		capabilities.ExecutorInputFormats = []string{"openai", "claude", "gemini"}

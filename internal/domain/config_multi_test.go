@@ -120,3 +120,32 @@ func TestEntryDefaultsSeededFromCode(t *testing.T) {
 		t.Fatalf("entry = %+v", entry)
 	}
 }
+
+func TestEffectiveCacheMaxEntriesUsesMax(t *testing.T) {
+	cfg := DefaultConfig()
+	cfg.VirtualModels = []VirtualModelEntry{
+		{Name: "a", Cache: CacheConfig{Enabled: true, MaxEntries: 1}},
+		{Name: "b", Cache: CacheConfig{Enabled: true, MaxEntries: 50}},
+		{Name: "c", Cache: CacheConfig{Enabled: false, MaxEntries: 999}},
+	}
+	if got := cfg.Normalize().EffectiveCacheMaxEntries(); got != 50 {
+		t.Fatalf("max entries = %d, want 50", got)
+	}
+}
+
+func TestNormalizeDoesNotMutateSharedSlices(t *testing.T) {
+	cfg := multiEntryYAML()
+	before := cfg.VirtualModels[0].Models[0].Model
+	for i := 0; i < 5; i++ {
+		_ = cfg.Normalize()
+	}
+	if cfg.VirtualModels[0].Models[0].Model != before {
+		t.Fatalf("shared config mutated: %q", cfg.VirtualModels[0].Models[0].Model)
+	}
+	first := cfg.Normalize()
+	second := cfg.Normalize()
+	first.VirtualModels[0].Models[0].Model = "mutated"
+	if second.VirtualModels[0].Models[0].Model == "mutated" {
+		t.Fatal("normalized copies share backing arrays")
+	}
+}

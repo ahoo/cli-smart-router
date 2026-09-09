@@ -320,8 +320,92 @@ func (c Config) VirtualModelNames() []string {
 	return out
 }
 
+// cloneStrings copies a string slice so normalization never mutates shared backing arrays.
+func cloneStrings(in []string) []string {
+	if in == nil {
+		return nil
+	}
+	out := make([]string, len(in))
+	copy(out, in)
+	return out
+}
+
+// cloneCandidateConfigs deep-copies candidates (including capability lists).
+func cloneCandidateConfigs(in []CandidateConfig) []CandidateConfig {
+	if in == nil {
+		return nil
+	}
+	out := make([]CandidateConfig, len(in))
+	copy(out, in)
+	for i := range out {
+		out[i].Capabilities = cloneStrings(in[i].Capabilities)
+	}
+	return out
+}
+
+// cloneClassifierModels copies the ordered classifier targets.
+func cloneClassifierModels(in []ClassifierModel) []ClassifierModel {
+	if in == nil {
+		return nil
+	}
+	out := make([]ClassifierModel, len(in))
+	copy(out, in)
+	return out
+}
+
+// cloneRoutes copies route rules. Condition scalar pointers are read-only
+// during normalization and routing, so sharing them is safe.
+func cloneRoutes(in []RouteRule) []RouteRule {
+	if in == nil {
+		return nil
+	}
+	out := make([]RouteRule, len(in))
+	copy(out, in)
+	return out
+}
+
+// cloneEntries deep-copies virtual model entries with their nested slices.
+func cloneEntries(in []VirtualModelEntry) []VirtualModelEntry {
+	if in == nil {
+		return nil
+	}
+	out := make([]VirtualModelEntry, len(in))
+	copy(out, in)
+	for i := range out {
+		out[i].Models = cloneCandidateConfigs(in[i].Models)
+		out[i].Routes = cloneRoutes(in[i].Routes)
+		out[i].Classifier.Models = cloneClassifierModels(in[i].Classifier.Models)
+	}
+	return out
+}
+
+// EffectiveCacheMaxEntries returns the route-cache capacity for the shared
+// global cache map: the largest max_entries among cache-enabled entries.
+// The map is shared across entries (keys already include the requested model),
+// so per-entry values cannot partition it; using the max keeps a small entry
+// from evicting every other entry's routes.
+func (c Config) EffectiveCacheMaxEntries() int {
+	max := 0
+	for _, entry := range c.ResolveEntries() {
+		if entry.Cache.Enabled && entry.Cache.MaxEntries > max {
+			max = entry.Cache.MaxEntries
+		}
+	}
+	if max <= 0 {
+		return 1024
+	}
+	return max
+}
+
 // Normalize fills defaults and trims user-provided strings.
+// It deep-copies every slice first: ConfigStore holds one shared Config value
+// and Load hands out shallow copies, so in-place normalization would race on
+// the shared backing arrays under concurrent multi-model requests.
 func (c Config) Normalize() Config {
+	c.Models = cloneCandidateConfigs(c.Models)
+	c.Routes = cloneRoutes(c.Routes)
+	c.Classifier.Models = cloneClassifierModels(c.Classifier.Models)
+	c.VirtualModels = cloneEntries(c.VirtualModels)
 	if strings.TrimSpace(c.VirtualModel) == "" {
 		c.VirtualModel = DefaultVirtualModel
 	}
