@@ -1,8 +1,8 @@
 # Smart Model Router
 
-`smart-model-router` is a native CLIProxyAPI plugin that registers a configurable virtual model and routes requests for that model to a real built-in provider/model.
+`smart-model-router` is a native CLIProxyAPI plugin that registers configurable virtual models and routes requests for those models to real built-in provider/models.
 
-The default virtual model is `router:auto`, but the name is configurable through `virtual_model`.
+The default virtual model is `router:auto`, but names are configurable through `virtual_model` (single) or `virtual_models` (multiple independently routable entries, e.g. `router-cheap`, `router-security`). See `configs/smart-model-router_multi.yaml` and `docs/adr/0007-multi-virtual-models.md`.
 
 ## Current Scope
 

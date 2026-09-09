@@ -2,7 +2,6 @@ package application
 
 import (
 	"fmt"
-	"strings"
 
 	"github.com/vfeitoza/cli-smart-router/internal/domain"
 	"github.com/vfeitoza/cli-smart-router/internal/infrastructure"
@@ -13,12 +12,18 @@ type Router struct {
 	Config domain.Config
 }
 
-// Route chooses a provider/model for the configured virtual model.
+// Route chooses a provider/model for the requested virtual model. Requests for
+// models outside the configured virtual model set return Handled:false.
 func (r Router) Route(req infrastructure.ModelRouteRequest) domain.RouteDecision {
 	cfg := r.Config.Normalize()
-	if !cfg.Enabled || strings.TrimSpace(req.RequestedModel) != cfg.VirtualModel {
+	if !cfg.Enabled {
 		return domain.RouteDecision{Handled: false}
 	}
+	scoped, ok := cfg.WithEntry(req.RequestedModel)
+	if !ok {
+		return domain.RouteDecision{Handled: false}
+	}
+	cfg = scoped
 	candidates := cfg.Candidates()
 	prompt := infrastructure.ExtractUserPrompt(req.Body)
 	score, ok := domain.SelectCandidateWithConfidence(candidates, req.AvailableProviders, prompt, cfg.Preference)

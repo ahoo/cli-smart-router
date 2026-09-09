@@ -96,6 +96,8 @@ Type: `string`
 
 The model name clients should request. The router only handles requests where the requested model exactly matches this value. All other model requests return `Handled: false` and are left to CLIProxyAPI or other routers.
 
+This legacy single-model field is used only when `virtual_models` is absent. When `virtual_models` holds at least one named entry, `virtual_model` is ignored for routing (it is still reported on the status endpoint for backward compatibility).
+
 Default in code: `router:auto`
 
 Examples:
@@ -107,6 +109,34 @@ virtual_model: router:auto
 ```yaml
 virtual_model: claude-auto
 ```
+
+### `virtual_models`
+
+Type: `list of objects`
+
+Multiple independently routable virtual models. Each entry has a `name` plus its own `strategy`, `preference`, `models`, `routes`, `classifier`, `cache`, and `routing`. Entries never inherit routing fields from the top level; unset entry fields fall back to code defaults. See `docs/adr/0007-multi-virtual-models.md` and `configs/smart-model-router_multi.yaml`.
+
+Example:
+
+```yaml
+virtual_models:
+  - name: router-cheap
+    strategy: hybrid
+    preference: cost
+    models:
+      - {provider: codex, model: gpt-5.4-mini, capabilities: [summarize, fast, low_cost], cost: low, quality: medium}
+  - name: router-security
+    strategy: decision_engine
+    preference: quality
+    routes:
+      - when: {task: security}
+        provider: claude
+        model: claude-opus-4-8
+    models:
+      - {provider: claude, model: claude-opus-4-8, capabilities: [security, reasoning], cost: very_high, quality: highest}
+```
+
+Session pins, route cache entries, and Decision Engine fallback chains are namespaced per virtual model, so one session can pin different models per entry.
 
 ### `strategy`
 

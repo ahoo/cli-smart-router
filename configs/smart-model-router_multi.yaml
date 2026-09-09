@@ -1,0 +1,44 @@
+plugins:
+  enabled: true
+  dir: plugins
+  configs:
+    smart-model-router:
+      enabled: true
+      priority: 100
+      # Multiple independently routable virtual models. Each entry has its own
+      # strategy, preference, models, routes, classifier, cache, and routing.
+      # Entries never inherit routing fields from the top level.
+      virtual_models:
+        - name: router-cheap
+          strategy: hybrid
+          preference: cost
+          cache: {enabled: true, max_entries: 1024, ttl: 24h}
+          classifier:
+            enabled: true
+            models:
+              - {provider: codex, model: gpt-5.4-mini}
+            timeout: 8s
+            max_attempts: 2
+          routing: {keep_same_model_per_session: true, allow_fallback: true}
+          models:
+            - {provider: codex, model: gpt-5.4-mini, capabilities: [classify, summarize, translate, simple_coding, fast, low_cost], cost: low, quality: medium}
+            - {provider: claude, model: claude-haiku-4-5-20251001, capabilities: [summarize, translate, fast], cost: low, quality: medium}
+        - name: router-security
+          strategy: decision_engine
+          preference: quality
+          routing: {keep_same_model_per_session: true, allow_fallback: true}
+          routes:
+            - when: {task: security}
+              provider: claude
+              model: claude-opus-4-8
+            - when: {}
+              provider: claude
+              model: claude-sonnet-5
+          models:
+            - {provider: claude, model: claude-opus-4-8, capabilities: [security, reasoning, architecture], cost: very_high, quality: highest}
+            - {provider: claude, model: claude-sonnet-5, capabilities: [reasoning, coding, architecture], cost: high, quality: high}
+      # Plugin-wide fields (shared by all entries).
+      state_path: smart-model-router-state.json
+      debug: {enabled: true, log_path: smart-model-router-decisions.jsonl}
+      catalog: {source: cli_proxy_api, base_url: http://127.0.0.1:8317, refresh_interval: 10m}
+      pricing: {enabled: false}

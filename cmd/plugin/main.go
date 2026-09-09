@@ -213,12 +213,15 @@ func routeModel(raw []byte) ([]byte, error) {
 	if errUnmarshal := json.Unmarshal(raw, &req); errUnmarshal != nil {
 		return nil, errUnmarshal
 	}
-	cfg := configStore.Load()
-	if strings.TrimSpace(req.RequestedModel) != cfg.VirtualModel {
+	full := configStore.Load()
+	scoped, ok := full.WithEntry(req.RequestedModel)
+	if !ok {
 		return infrastructure.OKEnvelope(infrastructure.ModelRouteResponse{Handled: false})
 	}
+	cfg := scoped
 	runtimeState.Inc("router_requests_total")
-	refreshExternalState(cfg)
+	// Catalog/pricing refresh is plugin-wide: exclude every virtual model name.
+	refreshExternalState(full)
 	if sessionEntry, ok := sessionRoute(cfg, req.ModelRouteRequest); ok {
 		logRouteDecision(cfg, req.ModelRouteRequest, sessionEntry, "session", nil, nil)
 		return routeResponse(sessionEntry, cfg, req.ModelRouteRequest)
@@ -423,7 +426,8 @@ func storeFallbackChain(cfg domain.Config, req infrastructure.ModelRouteRequest,
 		models = append(models, decision.Model)
 		providers = append(providers, decision.Provider)
 	}
-	runtimeState.SetFallbackChain(sessionID, providers, models)
+	// Same namespace as session routes: one chain per virtual model per session.
+	runtimeState.SetFallbackChain(cfg.VirtualModel+"\x00"+sessionID, providers, models)
 }
 
 func logRouteDecision(cfg domain.Config, req infrastructure.ModelRouteRequest, entry infrastructure.RouteCacheEntry, source string, classifier *classifierTrace, decision *decisionTrace) {
@@ -521,11 +525,23 @@ func fetchModelCatalog(cfg domain.Config) ([]string, error) {
 	if err := json.Unmarshal(body, &payload); err != nil {
 		return nil, err
 	}
+	// Exclude every virtual model name unless explicitly included, so the
+	// catalog only reflects real upstream models.
+	excluded := map[string]struct{}{}
+	if !cfg.Catalog.IncludeRouterModel {
+		for _, name := range cfg.VirtualModelNames() {
+			excluded[name] = struct{}{}
+		}
+	}
 	models := make([]string, 0, len(payload.Data))
 	for _, item := range payload.Data {
-		if item.ID != "" && (cfg.Catalog.IncludeRouterModel || item.ID != cfg.VirtualModel) {
-			models = append(models, item.ID)
+		if item.ID == "" {
+			continue
 		}
+		if _, skip := excluded[item.ID]; skip {
+			continue
+		}
+		models = append(models, item.ID)
 	}
 	return models, nil
 }
@@ -550,6 +566,14 @@ func sessionRoute(cfg domain.Config, req infrastructure.ModelRouteRequest) (infr
 		return infrastructure.RouteCacheEntry{}, false
 	}
 	sessionID := metadataString(req.Metadata, "execution_session_id")
+	// Namespace sessions per virtual model: the same session may use different
+	// virtual models for different turns, and each entry keeps its own pin.
+	// Sessions pinned before multi-virtual-model namespacing use the bare
+	// session id; keep reading them so pins survive upgrade (one lookup only,
+	// new pins always use the namespaced key).
+	if entry, ok := runtimeState.GetSessionRoute(cfg.VirtualModel + "\x00" + sessionID); ok {
+		return entry, true
+	}
 	return runtimeState.GetSessionRoute(sessionID)
 }
 
@@ -565,8 +589,9 @@ func storeRoute(cfg domain.Config, req infrastructure.ModelRouteRequest, entry i
 		runtimeState.SetCachedRoute(routeCacheKey(req), entry, cfg.Cache.MaxEntries)
 	}
 	if cfg.Routing.KeepSameModelPerSession {
+		// Same namespace as sessionRoute: one pin per virtual model per session.
 		if sessionID := metadataString(req.Metadata, "execution_session_id"); sessionID != "" {
-			runtimeState.SetSessionRoute(sessionID, entry)
+			runtimeState.SetSessionRoute(cfg.VirtualModel+"\x00"+sessionID, entry)
 		}
 	}
 	runtimeState.SaveThrottled(cfg.StatePath, 30*time.Second)
@@ -901,13 +926,24 @@ func executeWithFallback(raw []byte) ([]byte, error) {
 // executorCandidateChain returns the ordered provider/model pairs the executor
 // should try. It uses the Decision Engine's cached policy chain for the request's
 // session when present; otherwise it uses the configured model order, capped by
-// executor_fallback.max_attempts (legacy behavior).
+// executor_fallback.max_attempts (legacy behavior). Both the chain lookup and the
+// configured order are scoped to the requested virtual model entry.
 func executorCandidateChain(cfg domain.Config, req infrastructure.ExecutorRPCRequest) ([]string, []string) {
+	scoped := cfg.Normalize()
+	if entry, ok := scoped.WithEntry(req.Model); ok {
+		scoped = entry
+	}
 	if sessionID := metadataString(req.Metadata, "execution_session_id"); sessionID != "" {
+		if chain, ok := runtimeState.GetFallbackChain(scoped.VirtualModel + "\x00" + sessionID); ok {
+			return chain.Providers, chain.Models
+		}
+		// Legacy chains stored before multi-virtual-model namespacing use the
+		// bare session id; keep reading them so in-flight sessions survive upgrade.
 		if chain, ok := runtimeState.GetFallbackChain(sessionID); ok {
 			return chain.Providers, chain.Models
 		}
 	}
+	cfg = scoped
 	maxAttempts := cfg.ExecutorFallback.MaxAttempts
 	if maxAttempts <= 0 || maxAttempts > len(cfg.Models) {
 		maxAttempts = len(cfg.Models)
@@ -946,13 +982,15 @@ func managementHandle(raw []byte) ([]byte, error) {
 		})
 	}
 	snapshot := runtimeState.Snapshot()
+	stored := configStore.Load()
 	body, errMarshal := json.Marshal(map[string]any{
-		"plugin":        pluginIdentifier,
-		"virtual_model": configStore.Load().VirtualModel,
-		"strategy":      configStore.Load().Strategy,
-		"usage":         usageLearner.Snapshot(),
-		"last_decision": snapshot.LastDecision,
-		"state":         snapshot,
+		"plugin":         pluginIdentifier,
+		"virtual_model":  stored.VirtualModel,
+		"virtual_models": stored.VirtualModelNames(),
+		"strategy":       stored.Strategy,
+		"usage":          usageLearner.Snapshot(),
+		"last_decision":  snapshot.LastDecision,
+		"state":          snapshot,
 	})
 	if errMarshal != nil {
 		return nil, errMarshal
@@ -982,11 +1020,12 @@ func pluginRegistration() registration {
 		SchemaVersion: infrastructure.SchemaVersion,
 		Metadata: infrastructure.Metadata{
 			Name:             pluginIdentifier,
-			Version:          "0.1.2",
+			Version:          "0.2.0",
 			Author:           "Victor Feitoza",
 			GitHubRepository: "https://github.com/vfeitoza/cli-smart-router",
 			ConfigFields: []infrastructure.ConfigField{
-				{Name: "virtual_model", Type: infrastructure.ConfigFieldTypeString, Description: "Virtual model name intercepted by the router. Default: router:auto."},
+				{Name: "virtual_model", Type: infrastructure.ConfigFieldTypeString, Description: "Legacy single virtual model name. Used only when virtual_models is absent. Default: router:auto."},
+				{Name: "virtual_models", Type: infrastructure.ConfigFieldTypeObject, Description: "Multiple independently routable virtual models. Each entry has name plus its own strategy, preference, models, routes, classifier, cache, and routing. Entries never inherit routing fields from the top level."},
 				{Name: "strategy", Type: infrastructure.ConfigFieldTypeEnum, EnumValues: []string{"capability", "benchmark", "llm", "hybrid", "decision_engine"}, Description: "Routing strategy. decision_engine evaluates declarative routes before deterministic fallback."},
 				{Name: "debug", Type: infrastructure.ConfigFieldTypeObject, Description: "Optional non-sensitive route decision JSONL logging settings."},
 				{Name: "catalog", Type: infrastructure.ConfigFieldTypeObject, Description: "Catalog refresh settings for CLIProxyAPI /v1/models."},
