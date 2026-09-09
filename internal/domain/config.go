@@ -272,11 +272,27 @@ func (c Config) ResolveEntries() []ResolvedEntry {
 	return out
 }
 
+// stripThinkingSuffix removes a host thinking suffix ("model(high)" -> "model")
+// so entry lookup works even if the host forwards the raw requested name.
+// The host normally strips suffixes before routing; this is belt and braces.
+func stripThinkingSuffix(name string) string {
+	open := strings.LastIndex(name, "(")
+	if open <= 0 || !strings.HasSuffix(name, ")") {
+		return name
+	}
+	base := strings.TrimSpace(name[:open])
+	suffix := strings.TrimSpace(name[open+1 : len(name)-1])
+	if base == "" || suffix == "" {
+		return name
+	}
+	return base
+}
+
 // LookupEntry finds the entry whose name exactly matches the requested model.
 // Matching is case-sensitive (like the legacy single-model check); callers
-// trim the requested name before lookup.
+// trim the requested name before lookup. A thinking suffix is stripped first.
 func (c Config) LookupEntry(name string) (ResolvedEntry, bool) {
-	name = strings.TrimSpace(name)
+	name = stripThinkingSuffix(strings.TrimSpace(name))
 	if name == "" {
 		return ResolvedEntry{}, false
 	}

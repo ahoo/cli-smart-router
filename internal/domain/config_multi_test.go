@@ -149,3 +149,15 @@ func TestNormalizeDoesNotMutateSharedSlices(t *testing.T) {
 		t.Fatal("normalized copies share backing arrays")
 	}
 }
+
+func TestLookupEntryStripsThinkingSuffix(t *testing.T) {
+	cfg := multiEntryYAML()
+	for _, name := range []string{"router-cheap(high)", "router-cheap", " router-security(xhigh) "} {
+		if _, ok := cfg.LookupEntry(name); !ok {
+			t.Fatalf("lookup %q should match", name)
+		}
+	}
+	if _, ok := cfg.LookupEntry("nope(high)"); ok {
+		t.Fatal("unknown model with suffix should not match")
+	}
+}
