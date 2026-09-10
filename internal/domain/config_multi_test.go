@@ -161,3 +161,29 @@ func TestLookupEntryStripsThinkingSuffix(t *testing.T) {
 		t.Fatal("unknown model with suffix should not match")
 	}
 }
+
+func TestNormalizeClassifierHeaders(t *testing.T) {
+	cfg := DefaultConfig()
+	cfg.Classifier.Models = []ClassifierModel{{
+		Provider: " codex ",
+		Model:    " m ",
+		Headers:  map[string]string{" X-Opencode-Session ": " ses1 ", "": "x", "Empty": "  "},
+	}}
+	got := cfg.Normalize().Classifier.Models[0]
+	if got.Provider != "codex" || got.Model != "m" {
+		t.Fatalf("model = %+v", got)
+	}
+	if len(got.Headers) != 1 || got.Headers["X-Opencode-Session"] != "ses1" {
+		t.Fatalf("headers = %+v", got.Headers)
+	}
+}
+
+func TestCloneClassifierModelsDeepCopiesHeaders(t *testing.T) {
+	cfg := multiEntryYAML()
+	first := cfg.Normalize()
+	second := cfg.Normalize()
+	first.Classifier.Models = append(first.Classifier.Models, ClassifierModel{Model: "x"})
+	if len(second.Classifier.Models) == len(first.Classifier.Models) {
+		t.Fatal("normalized classifier models share backing arrays")
+	}
+}

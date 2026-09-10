@@ -660,7 +660,14 @@ func classifyRoute(cfg domain.Config, req infrastructure.ModelRouteRequest) (inf
 		trace.Model = classifier.Model
 		runtimeState.Inc("router_classifier_calls")
 		body := classifierRequestBody(classifier.Model, cfg, req)
-		resp, err := callHost[infrastructure.HostModelExecutionResponse](infrastructure.MethodHostModelExecute, infrastructure.HostModelExecutionRequest{EntryProtocol: "openai", ExitProtocol: "openai", Model: classifier.Model, Stream: false, Body: body})
+		var headers http.Header
+		if len(classifier.Headers) > 0 {
+			headers = http.Header{}
+			for k, v := range classifier.Headers {
+				headers.Set(k, v)
+			}
+		}
+		resp, err := callHost[infrastructure.HostModelExecutionResponse](infrastructure.MethodHostModelExecute, infrastructure.HostModelExecutionRequest{EntryProtocol: "openai", ExitProtocol: "openai", Model: classifier.Model, Stream: false, Body: body, Headers: headers})
 		if err != nil || resp.StatusCode < 200 || resp.StatusCode >= 300 {
 			runtimeState.Inc("router_classifier_failures")
 			if err != nil {
@@ -741,6 +748,9 @@ func classifierRequestBody(classifierModel string, cfg domain.Config, req infras
 		"model":       classifierModel,
 		"stream":      false,
 		"temperature": 0,
+		// Reasoning-style classifiers emit thinking before the verdict; keep
+		// enough budget so the compact JSON still fits after the preamble.
+		"max_tokens": domain.DefaultClassifierMaxTokens,
 		"messages": []map[string]string{
 			{"role": "system", "content": system},
 			{"role": "user", "content": userContent},
@@ -799,14 +809,22 @@ func classifierContent(body []byte) []byte {
 	var openAI struct {
 		Choices []struct {
 			Message struct {
-				Content string `json:"content"`
+				Content          string `json:"content"`
+				ReasoningContent string `json:"reasoning_content"`
+				Reasoning        string `json:"reasoning"`
 			} `json:"message"`
 		} `json:"choices"`
 	}
 	if err := json.Unmarshal(body, &openAI); err == nil && len(openAI.Choices) > 0 {
-		content := strings.TrimSpace(openAI.Choices[0].Message.Content)
-		if content != "" {
-			return []byte(content)
+		msg := openAI.Choices[0].Message
+		// Prefer the answer body; fall back to thinking fields for
+		// reasoning-style classifiers (e.g. qwen3.5) that emit their verdict
+		// inside the thinking trace. extractJSONObject downstream extracts
+		// the JSON verdict from surrounding prose either way.
+		for _, text := range []string{msg.Content, msg.ReasoningContent, msg.Reasoning} {
+			if trimmed := strings.TrimSpace(text); trimmed != "" {
+				return []byte(trimmed)
+			}
 		}
 	}
 	return body

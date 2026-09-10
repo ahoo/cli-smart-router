@@ -139,11 +139,19 @@ type ClassifierConfig struct {
 	MaxAttempts int               `yaml:"max_attempts"`
 }
 
-// ClassifierModel is one ordered fallback classifier target.
+// ClassifierModel is one ordered fallback classifier target. Headers are
+// forwarded to host.model.execute verbatim, e.g. X-Opencode-Session for
+// OpenCode free-tier models that reject headerless direct calls.
 type ClassifierModel struct {
-	Provider string `yaml:"provider"`
-	Model    string `yaml:"model"`
+	Provider string            `yaml:"provider"`
+	Model    string            `yaml:"model"`
+	Headers  map[string]string `yaml:"headers"`
 }
+
+// DefaultClassifierMaxTokens sizes classifier requests so reasoning-style
+// models (which emit their thinking before the answer) still have budget left
+// for the compact JSON verdict. The verdict itself is a few dozen tokens.
+const DefaultClassifierMaxTokens = 500
 
 // RoutingConfig controls policy-level routing preferences.
 type RoutingConfig struct {
@@ -359,13 +367,23 @@ func cloneCandidateConfigs(in []CandidateConfig) []CandidateConfig {
 	return out
 }
 
-// cloneClassifierModels copies the ordered classifier targets.
+// cloneClassifierModels copies the ordered classifier targets, including
+// their header maps, so normalization never shares mutable maps.
 func cloneClassifierModels(in []ClassifierModel) []ClassifierModel {
 	if in == nil {
 		return nil
 	}
 	out := make([]ClassifierModel, len(in))
 	copy(out, in)
+	for i := range out {
+		if in[i].Headers == nil {
+			continue
+		}
+		out[i].Headers = make(map[string]string, len(in[i].Headers))
+		for k, v := range in[i].Headers {
+			out[i].Headers[k] = v
+		}
+	}
 	return out
 }
 
@@ -493,12 +511,25 @@ func normalizeExecutorFallback(fallback *ExecutorFallbackConfig) {
 	}
 }
 
-// normalizeClassifier trims classifier fields and candidate references.
+// normalizeClassifier trims classifier fields, candidate references, and
+// header names/values. Empty header names or values are dropped.
 func normalizeClassifier(classifier *ClassifierConfig) {
 	classifier.Timeout = strings.TrimSpace(classifier.Timeout)
 	for i := range classifier.Models {
 		classifier.Models[i].Provider = strings.ToLower(strings.TrimSpace(classifier.Models[i].Provider))
 		classifier.Models[i].Model = strings.TrimSpace(classifier.Models[i].Model)
+		if len(classifier.Models[i].Headers) == 0 {
+			continue
+		}
+		cleaned := make(map[string]string, len(classifier.Models[i].Headers))
+		for k, v := range classifier.Models[i].Headers {
+			k = strings.TrimSpace(k)
+			v = strings.TrimSpace(v)
+			if k != "" && v != "" {
+				cleaned[k] = v
+			}
+		}
+		classifier.Models[i].Headers = cleaned
 	}
 }
 
