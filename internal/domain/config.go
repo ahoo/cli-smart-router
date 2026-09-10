@@ -94,6 +94,13 @@ type RouteCondition struct {
 	HasDiff *bool `yaml:"has_diff"`
 	// Stream, when set, matches only streaming (true) or non-streaming (false) requests.
 	Stream *bool `yaml:"stream"`
+	// PromptTemplate matches a lexical request shape by its stable identifier
+	// (see TemplateBoundedOutput / TemplateContinuation). These names are
+	// config-facing constants, never user text.
+	PromptTemplate string `yaml:"prompt_template"`
+	// MaxOutputHint matches when the prompt explicitly sizes its own answer,
+	// e.g. "recap in under 40 words". Set false to match prompts without one.
+	MaxOutputHint *bool `yaml:"max_output_hint"`
 }
 
 // DebugConfig controls non-sensitive route decision logs.
@@ -137,15 +144,19 @@ type ClassifierConfig struct {
 	Models      []ClassifierModel `yaml:"models"`
 	Timeout     string            `yaml:"timeout"`
 	MaxAttempts int               `yaml:"max_attempts"`
+	MaxTokens   int               `yaml:"max_tokens"`
 }
 
 // ClassifierModel is one ordered fallback classifier target. Headers are
 // forwarded to host.model.execute verbatim, e.g. X-Opencode-Session for
-// OpenCode free-tier models that reject headerless direct calls.
+// OpenCode free-tier models that reject headerless direct calls. RequestOverrides
+// carries provider-compatible request options; routing invariants are reapplied
+// after these values are merged into the request body.
 type ClassifierModel struct {
-	Provider string            `yaml:"provider"`
-	Model    string            `yaml:"model"`
-	Headers  map[string]string `yaml:"headers"`
+	Provider         string            `yaml:"provider"`
+	Model            string            `yaml:"model"`
+	Headers          map[string]string `yaml:"headers"`
+	RequestOverrides map[string]any    `yaml:"request_overrides"`
 }
 
 // DefaultClassifierMaxTokens sizes classifier requests so reasoning-style
@@ -195,6 +206,7 @@ func DefaultConfig() Config {
 		},
 		Cache:            CacheConfig{Enabled: true, MaxEntries: 1024},
 		ExecutorFallback: ExecutorFallbackConfig{MaxAttempts: 3},
+		Classifier:       ClassifierConfig{MaxTokens: DefaultClassifierMaxTokens},
 	}
 }
 
@@ -209,6 +221,7 @@ func (e *VirtualModelEntry) UnmarshalYAML(value *yaml.Node) error {
 	e.Preference = def.Preference
 	e.Cache = def.Cache
 	e.ExecutorFallback = def.ExecutorFallback
+	e.Classifier = def.Classifier
 	e.Routing = def.Routing
 	type plainEntry VirtualModelEntry
 	return value.Decode((*plainEntry)(e))
@@ -367,8 +380,37 @@ func cloneCandidateConfigs(in []CandidateConfig) []CandidateConfig {
 	return out
 }
 
+// cloneAny recursively copies YAML-compatible maps and slices.
+func cloneAny(value any) any {
+	switch typed := value.(type) {
+	case map[string]any:
+		out := make(map[string]any, len(typed))
+		for key, item := range typed {
+			out[key] = cloneAny(item)
+		}
+		return out
+	case map[string]string:
+		out := make(map[string]string, len(typed))
+		for key, item := range typed {
+			out[key] = item
+		}
+		return out
+	case []any:
+		out := make([]any, len(typed))
+		for i, item := range typed {
+			out[i] = cloneAny(item)
+		}
+		return out
+	case []string:
+		return cloneStrings(typed)
+	default:
+		return value
+	}
+}
+
 // cloneClassifierModels copies the ordered classifier targets, including
-// their header maps, so normalization never shares mutable maps.
+// their header and request-override maps, so normalization never shares
+// mutable values.
 func cloneClassifierModels(in []ClassifierModel) []ClassifierModel {
 	if in == nil {
 		return nil
@@ -376,12 +418,14 @@ func cloneClassifierModels(in []ClassifierModel) []ClassifierModel {
 	out := make([]ClassifierModel, len(in))
 	copy(out, in)
 	for i := range out {
-		if in[i].Headers == nil {
-			continue
+		if in[i].Headers != nil {
+			out[i].Headers = make(map[string]string, len(in[i].Headers))
+			for k, v := range in[i].Headers {
+				out[i].Headers[k] = v
+			}
 		}
-		out[i].Headers = make(map[string]string, len(in[i].Headers))
-		for k, v := range in[i].Headers {
-			out[i].Headers[k] = v
+		if in[i].RequestOverrides != nil {
+			out[i].RequestOverrides = cloneAny(in[i].RequestOverrides).(map[string]any)
 		}
 	}
 	return out
@@ -515,22 +559,31 @@ func normalizeExecutorFallback(fallback *ExecutorFallbackConfig) {
 // header names/values. Empty header names or values are dropped.
 func normalizeClassifier(classifier *ClassifierConfig) {
 	classifier.Timeout = strings.TrimSpace(classifier.Timeout)
+	if classifier.MaxTokens <= 0 {
+		classifier.MaxTokens = DefaultClassifierMaxTokens
+	}
 	for i := range classifier.Models {
 		classifier.Models[i].Provider = strings.ToLower(strings.TrimSpace(classifier.Models[i].Provider))
 		classifier.Models[i].Model = strings.TrimSpace(classifier.Models[i].Model)
-		if len(classifier.Models[i].Headers) == 0 {
-			continue
-		}
-		cleaned := make(map[string]string, len(classifier.Models[i].Headers))
-		for k, v := range classifier.Models[i].Headers {
-			k = strings.TrimSpace(k)
-			v = strings.TrimSpace(v)
-			if k != "" && v != "" {
-				cleaned[k] = v
+		if len(classifier.Models[i].Headers) > 0 {
+			cleaned := make(map[string]string, len(classifier.Models[i].Headers))
+			for k, v := range classifier.Models[i].Headers {
+				k = strings.TrimSpace(k)
+				v = strings.TrimSpace(v)
+				if k != "" && v != "" {
+					cleaned[k] = v
+				}
 			}
+			classifier.Models[i].Headers = cleaned
 		}
-		classifier.Models[i].Headers = cleaned
 	}
+	kept := classifier.Models[:0]
+	for _, model := range classifier.Models {
+		if model.Model != "" {
+			kept = append(kept, model)
+		}
+	}
+	classifier.Models = kept
 }
 
 // normalizeCandidates trims provider/model/cost/quality per candidate.

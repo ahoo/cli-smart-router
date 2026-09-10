@@ -84,7 +84,7 @@ valid task header is present, the router accepts `X-Router-Agent` values
 This keeps an implementer on a code route even when its attached plan mentions
 architecture or roadmap work.
 
-The classifier, when called, receives an isolated routing prompt with the configured model catalog and the extracted last user message. It must select a configured model; invalid classifier output falls back to the local deterministic decision.
+The classifier, when called, receives an isolated routing prompt with the configured model catalog and the extracted last user message. The prompt asks only for `{"selected_model":"<exact-id>"}`, treats the catalog and user text as untrusted data, and requests no reason or confidence (legacy extra fields are still accepted). Verdict parsing scans `content`, `reasoning_content`, and `reasoning` (or the raw body when no usable OpenAI message field exists) for the first exact configured-and-available model; anything else falls back to the local deterministic decision. Per-model `headers` are forwarded verbatim and `request_overrides` supplies extra provider options, while `model`/`messages`/`stream`/`temperature`/`max_tokens` always win. See `docs/configuration.md`.
 
 Default provider-route response:
 
@@ -94,7 +94,7 @@ Default provider-route response:
   "TargetKind": "provider",
   "Target": "codex",
   "TargetModel": "gpt-5.4-mini",
-  "Reason": "classifier:short routing reason"
+  "Reason": "classifier:gpt-5.4-mini"
 }
 ```
 
@@ -158,6 +158,7 @@ plugins:
             model: claude-haiku-4-5-20251001
         timeout: 8s
         max_attempts: 2
+        max_tokens: 1000
 
       routing:
         prefer_low_cost: true
@@ -258,7 +259,7 @@ GET /v0/management/plugins/smart-model-router/status
 
 The route is exposed by CLIProxyAPI under `/v0/management/...` and requires the management key.
 
-The response includes runtime state snapshots for catalog, pricing, counters, cache, sessions, and usage. It never stores prompts, request bodies, credentials, API keys, or response bodies.
+The response includes runtime state snapshots for catalog, pricing, counters, cache, sessions, usage, and a per-virtual-model classifier summary (enabled flag, models, max attempts, max tokens; headers and overrides excluded). It never stores prompts, request bodies, credentials, API keys, or response bodies.
 
 ## Live Verification Script
 
@@ -303,6 +304,16 @@ Useful options:
 - `--virtual-model <model>` overrides the default virtual model used by the check.
 - `--verbose` prints raw JSON responses in addition to the console summary.
 
+## Classifier Benchmark
+
+Use `scripts/benchmark_classifier.py` before enabling an LLM classifier. It runs the fixed 20-case synthetic corpus against one or more classifiers on separate connections, with no retries, and persists only sanitized rows (case id, classifier, HTTP status, latency, outcome, verdict source, expected/selected model, booleans).
+
+```bash
+python3 scripts/benchmark_classifier.py --classifiers minicpm5 --output /tmp/minicpm5.json
+```
+
+Eligibility gates: exactly 20 calls, at least 19 transport successes, at least 19 valid configured-and-available verdicts, at least 18 exact target matches, and an all-attempt p95 latency within `--p95-limit-ms` (default 2000). The script exits non-zero when a classifier misses a gate and never deletes or rewrites a previous result file. Add `--qwen-profile` for Qwen-specific provider options; MiMo requests automatically carry their required session header. It never sends a classifier request until `/v1/models` exposes both the classifier model and every catalog candidate.
+
 ## Debug Route Logs
 
 Enable non-sensitive JSONL route decision logs:
@@ -313,7 +324,7 @@ debug:
   log_path: smart-model-router-decisions.jsonl
 ```
 
-Each line includes the selected provider/model, strategy, preference, source, reason, and classifier trace when applicable. It does not log prompts, request bodies, credentials, API keys, or responses.
+Each line includes the selected provider/model, strategy, preference, source, reason, and structured classifier attempt trace when applicable (per-attempt outcome, HTTP status, latency, verdict source, selected model, plus totals). The trace never carries raw classifier responses or error text. It does not log prompts, request bodies, credentials, API keys, or responses.
 
 ## Documentation
 

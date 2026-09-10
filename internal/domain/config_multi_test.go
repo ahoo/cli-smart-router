@@ -187,3 +187,92 @@ func TestCloneClassifierModelsDeepCopiesHeaders(t *testing.T) {
 		t.Fatal("normalized classifier models share backing arrays")
 	}
 }
+
+func TestNormalizeClassifierMaxTokens(t *testing.T) {
+	cfg := Config{}
+	if got := cfg.Normalize().Classifier.MaxTokens; got != DefaultClassifierMaxTokens {
+		t.Fatalf("default max_tokens = %d, want %d", got, DefaultClassifierMaxTokens)
+	}
+	cfg.Classifier.MaxTokens = 1000
+	if got := cfg.Normalize().Classifier.MaxTokens; got != 1000 {
+		t.Fatalf("explicit max_tokens = %d, want 1000", got)
+	}
+}
+
+func TestCloneClassifierModelsDeepCopiesRequestOverrides(t *testing.T) {
+	cfg := DefaultConfig()
+	cfg.Classifier.Models = []ClassifierModel{{
+		Model: "qwen3.5",
+		RequestOverrides: map[string]any{
+			"response_format": map[string]any{"type": "json_object"},
+			"stops":           []any{"one", map[string]any{"nested": "value"}},
+			"string_stops":    []string{"one", "two"},
+			"string_map":      map[string]string{"key": "value"},
+		},
+	}}
+	first := cfg.Normalize()
+	second := cfg.Normalize()
+	firstFormat := first.Classifier.Models[0].RequestOverrides["response_format"].(map[string]any)
+	firstFormat["type"] = "changed"
+	firstStops := first.Classifier.Models[0].RequestOverrides["stops"].([]any)
+	firstStops[1].(map[string]any)["nested"] = "changed"
+	first.Classifier.Models[0].RequestOverrides["string_stops"].([]string)[0] = "changed"
+	first.Classifier.Models[0].RequestOverrides["string_map"].(map[string]string)["key"] = "changed"
+	secondOverrides := second.Classifier.Models[0].RequestOverrides
+	if got := secondOverrides["response_format"].(map[string]any)["type"]; got != "json_object" {
+		t.Fatalf("response_format shared across normalized configs: %v", got)
+	}
+	if got := secondOverrides["stops"].([]any)[1].(map[string]any)["nested"]; got != "value" {
+		t.Fatalf("nested override shared across normalized configs: %v", got)
+	}
+	if got := secondOverrides["string_stops"].([]string)[0]; got != "one" {
+		t.Fatalf("string slice override shared across normalized configs: %v", got)
+	}
+	if got := secondOverrides["string_map"].(map[string]string)["key"]; got != "value" {
+		t.Fatalf("string map override shared across normalized configs: %v", got)
+	}
+}
+
+func TestNormalizeClassifierDropsEmptyModelsBeforeAttemptLimit(t *testing.T) {
+	cfg := DefaultConfig()
+	cfg.Classifier.MaxAttempts = 2
+	cfg.Classifier.Models = []ClassifierModel{
+		{Model: "  "},
+		{Model: "first"},
+		{Model: "second"},
+	}
+	got := cfg.Normalize().Classifier.Models
+	if len(got) != 2 || got[0].Model != "first" || got[1].Model != "second" {
+		t.Fatalf("normalized classifier models = %+v", got)
+	}
+}
+
+func TestUnmarshalClassifierTuningFields(t *testing.T) {
+	var cfg Config
+	raw := `
+classifier:
+  enabled: true
+  max_tokens: 1000
+  models:
+    - provider: siliconflow
+      model: qwen3.5
+      request_overrides:
+        response_format: {type: json_object}
+        thinking_budget: 128
+`
+	if err := yaml.Unmarshal([]byte(raw), &cfg); err != nil {
+		t.Fatal(err)
+	}
+	got := cfg.Normalize().Classifier
+	if got.MaxTokens != 1000 || len(got.Models) != 1 {
+		t.Fatalf("classifier = %+v", got)
+	}
+	overrides := got.Models[0].RequestOverrides
+	if overrides["thinking_budget"] != 128 {
+		t.Fatalf("thinking_budget = %#v", overrides["thinking_budget"])
+	}
+	format, ok := overrides["response_format"].(map[string]any)
+	if !ok || format["type"] != "json_object" {
+		t.Fatalf("response_format = %#v", overrides["response_format"])
+	}
+}
