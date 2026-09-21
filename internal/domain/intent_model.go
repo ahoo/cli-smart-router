@@ -48,6 +48,13 @@ func loadIntentModel() (*intentModel, error) {
 			intentState.err = fmt.Errorf("domain: embedded intent model has inconsistent dimensions")
 			return
 		}
+		features := len(m.Word.IDF) + len(m.Char.IDF)
+		for c, row := range m.Coef {
+			if len(row) != features {
+				intentState.err = fmt.Errorf("domain: embedded intent model class %d has %d weights, want %d", c, len(row), features)
+				return
+			}
+		}
 		intentState.model = &m
 	})
 	return intentState.model, intentState.err
@@ -159,6 +166,9 @@ func intentBigrams(tokens []string) []string {
 // IntentUnknown only through the caller's threshold gate; an internal error
 // returns (IntentUnknown, -1) so callers fall back to legacy detection.
 func ClassifyIntentModel(prompt string) (Intent, float64) {
+	if strings.TrimSpace(prompt) == "" {
+		return IntentUnknown, -1
+	}
 	model, err := loadIntentModel()
 	if err != nil {
 		return IntentUnknown, -1
