@@ -374,6 +374,16 @@ func (s *RuntimeState) GetSessionRoute(sessionID string) (RouteCacheEntry, bool)
 	return entry, true
 }
 
+// DeleteSessionRoute removes a pinned session route, if present.
+func (s *RuntimeState) DeleteSessionRoute(sessionID string) {
+	if s == nil || sessionID == "" {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	delete(s.data.Sessions, sessionID)
+}
+
 // SetSessionRoute pins a route to a session, evicting the least recently used
 // session when the map is full so it stays bounded on long-running proxies.
 func (s *RuntimeState) SetSessionRoute(sessionID string, entry RouteCacheEntry) {

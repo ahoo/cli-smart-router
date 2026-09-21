@@ -2,6 +2,8 @@ package domain
 
 import (
 	"strings"
+
+	"gopkg.in/yaml.v3"
 )
 
 const (
@@ -21,15 +23,39 @@ const (
 )
 
 // Config contains plugin-owned configuration parsed from config_yaml.
+// Routing behavior is driven by EffectiveEntries: when `virtual_models` is set,
+// each entry is an independently routable virtual model with its own strategy,
+// preference, candidates, rules, classifier, cache, and routing policy. When
+// `virtual_models` is absent, the legacy top-level `virtual_model` plus the
+// top-level routing fields form the single entry (backward compatible).
 type Config struct {
 	Enabled          bool                   `yaml:"enabled"`
 	VirtualModel     string                 `yaml:"virtual_model"`
+	VirtualModels    []VirtualModelEntry    `yaml:"virtual_models"`
 	Strategy         string                 `yaml:"strategy"`
 	Preference       string                 `yaml:"preference"`
 	StatePath        string                 `yaml:"state_path"`
 	Debug            DebugConfig            `yaml:"debug"`
 	Catalog          CatalogConfig          `yaml:"catalog"`
 	Pricing          PricingConfig          `yaml:"pricing"`
+	Cache            CacheConfig            `yaml:"cache"`
+	ExecutorFallback ExecutorFallbackConfig `yaml:"executor_fallback"`
+	Classifier       ClassifierConfig       `yaml:"classifier"`
+	Routing          RoutingConfig          `yaml:"routing"`
+	Routes           []RouteRule            `yaml:"routes"`
+	Models           []CandidateConfig      `yaml:"models"`
+}
+
+// VirtualModelEntry is one independently routable virtual model. Every field
+// except Name falls back to code defaults (the same defaults DefaultConfig
+// applies to the legacy top-level fields) when unset, so entries never inherit
+// from the top-level routing fields: each entry resolves to a complete,
+// self-contained routing configuration. An empty `routing`/`cache`/
+// `executor_fallback` block means "use defaults", not "disable everything".
+type VirtualModelEntry struct {
+	Name             string                 `yaml:"name"`
+	Strategy         string                 `yaml:"strategy"`
+	Preference       string                 `yaml:"preference"`
 	Cache            CacheConfig            `yaml:"cache"`
 	ExecutorFallback ExecutorFallbackConfig `yaml:"executor_fallback"`
 	Classifier       ClassifierConfig       `yaml:"classifier"`
@@ -68,6 +94,13 @@ type RouteCondition struct {
 	HasDiff *bool `yaml:"has_diff"`
 	// Stream, when set, matches only streaming (true) or non-streaming (false) requests.
 	Stream *bool `yaml:"stream"`
+	// PromptTemplate matches a lexical request shape by its stable identifier
+	// (see TemplateBoundedOutput / TemplateContinuation). These names are
+	// config-facing constants, never user text.
+	PromptTemplate string `yaml:"prompt_template"`
+	// MaxOutputHint matches when the prompt explicitly sizes its own answer,
+	// e.g. "recap in under 40 words". Set false to match prompts without one.
+	MaxOutputHint *bool `yaml:"max_output_hint"`
 }
 
 // DebugConfig controls non-sensitive route decision logs.
@@ -111,13 +144,25 @@ type ClassifierConfig struct {
 	Models      []ClassifierModel `yaml:"models"`
 	Timeout     string            `yaml:"timeout"`
 	MaxAttempts int               `yaml:"max_attempts"`
+	MaxTokens   int               `yaml:"max_tokens"`
 }
 
-// ClassifierModel is one ordered fallback classifier target.
+// ClassifierModel is one ordered fallback classifier target. Headers are
+// forwarded to host.model.execute verbatim, e.g. X-Opencode-Session for
+// OpenCode free-tier models that reject headerless direct calls. RequestOverrides
+// carries provider-compatible request options; routing invariants are reapplied
+// after these values are merged into the request body.
 type ClassifierModel struct {
-	Provider string `yaml:"provider"`
-	Model    string `yaml:"model"`
+	Provider         string            `yaml:"provider"`
+	Model            string            `yaml:"model"`
+	Headers          map[string]string `yaml:"headers"`
+	RequestOverrides map[string]any    `yaml:"request_overrides"`
 }
+
+// DefaultClassifierMaxTokens sizes classifier requests so reasoning-style
+// models (which emit their thinking before the answer) still have budget left
+// for the compact JSON verdict. The verdict itself is a few dozen tokens.
+const DefaultClassifierMaxTokens = 500
 
 // RoutingConfig controls policy-level routing preferences.
 type RoutingConfig struct {
@@ -161,11 +206,284 @@ func DefaultConfig() Config {
 		},
 		Cache:            CacheConfig{Enabled: true, MaxEntries: 1024},
 		ExecutorFallback: ExecutorFallbackConfig{MaxAttempts: 3},
+		Classifier:       ClassifierConfig{MaxTokens: DefaultClassifierMaxTokens},
 	}
 }
 
+// UnmarshalYAML seeds the entry with code defaults before decoding, so a YAML
+// entry that only sets name+models still gets the same cache, session-affinity,
+// and fallback defaults as the legacy top-level fields. Decoding only touches
+// keys present in the YAML, so explicitly set values (including false) always
+// win over the seeded defaults.
+func (e *VirtualModelEntry) UnmarshalYAML(value *yaml.Node) error {
+	def := DefaultConfig()
+	e.Strategy = def.Strategy
+	e.Preference = def.Preference
+	e.Cache = def.Cache
+	e.ExecutorFallback = def.ExecutorFallback
+	e.Classifier = def.Classifier
+	e.Routing = def.Routing
+	type plainEntry VirtualModelEntry
+	return value.Decode((*plainEntry)(e))
+}
+
+// ResolvedEntry is one fully-resolved routable virtual model: its name plus a
+// complete routing configuration. Entries never inherit routing fields from the
+// top level; unset entry fields fall back to code defaults (the same defaults
+// DefaultConfig applies to the legacy top-level fields).
+type ResolvedEntry struct {
+	Name             string
+	Strategy         string
+	Preference       string
+	Cache            CacheConfig
+	ExecutorFallback ExecutorFallbackConfig
+	Classifier       ClassifierConfig
+	Routing          RoutingConfig
+	Routes           []RouteRule
+	Models           []CandidateConfig
+}
+
+// Candidates converts the entry's models into normalized routing candidates.
+func (e ResolvedEntry) Candidates() []Candidate {
+	out := make([]Candidate, 0, len(e.Models))
+	for _, item := range e.Models {
+		out = append(out, CandidateFromConfig(item))
+	}
+	return out
+}
+
+// ResolveEntries returns every routable virtual model. When `virtual_models`
+// holds at least one named entry, each entry resolves independently. Otherwise
+// the legacy top-level routing fields form the single entry, so old configs
+// keep working unchanged.
+func (c Config) ResolveEntries() []ResolvedEntry {
+	cfg := c.Normalize()
+	if len(cfg.VirtualModels) == 0 {
+		return []ResolvedEntry{{
+			Name:             cfg.VirtualModel,
+			Strategy:         cfg.Strategy,
+			Preference:       cfg.Preference,
+			Cache:            cfg.Cache,
+			ExecutorFallback: cfg.ExecutorFallback,
+			Classifier:       cfg.Classifier,
+			Routing:          cfg.Routing,
+			Routes:           cfg.Routes,
+			Models:           cfg.Models,
+		}}
+	}
+	out := make([]ResolvedEntry, 0, len(cfg.VirtualModels))
+	seen := make(map[string]struct{}, len(cfg.VirtualModels))
+	for _, item := range cfg.VirtualModels {
+		if _, dup := seen[item.Name]; dup {
+			continue
+		}
+		seen[item.Name] = struct{}{}
+		out = append(out, ResolvedEntry{
+			Name:             item.Name,
+			Strategy:         item.Strategy,
+			Preference:       item.Preference,
+			Cache:            item.Cache,
+			ExecutorFallback: item.ExecutorFallback,
+			Classifier:       item.Classifier,
+			Routing:          item.Routing,
+			Routes:           item.Routes,
+			Models:           item.Models,
+		})
+	}
+	return out
+}
+
+// stripThinkingSuffix removes a host thinking suffix ("model(high)" -> "model")
+// so entry lookup works even if the host forwards the raw requested name.
+// The host normally strips suffixes before routing; this is belt and braces.
+func stripThinkingSuffix(name string) string {
+	open := strings.LastIndex(name, "(")
+	if open <= 0 || !strings.HasSuffix(name, ")") {
+		return name
+	}
+	base := strings.TrimSpace(name[:open])
+	suffix := strings.TrimSpace(name[open+1 : len(name)-1])
+	if base == "" || suffix == "" {
+		return name
+	}
+	return base
+}
+
+// LookupEntry finds the entry whose name exactly matches the requested model.
+// Matching is case-sensitive (like the legacy single-model check); callers
+// trim the requested name before lookup. A thinking suffix is stripped first.
+func (c Config) LookupEntry(name string) (ResolvedEntry, bool) {
+	name = stripThinkingSuffix(strings.TrimSpace(name))
+	if name == "" {
+		return ResolvedEntry{}, false
+	}
+	for _, entry := range c.ResolveEntries() {
+		if entry.Name == name {
+			return entry, true
+		}
+	}
+	return ResolvedEntry{}, false
+}
+
+// WithEntry returns an entry-scoped Config copy for the requested model name:
+// VirtualModel plus all routing fields come from the matched entry, while
+// plugin-wide fields (Enabled, StatePath, Debug, Catalog, Pricing) stay from
+// the top level. Downstream code keeps using Config unchanged.
+func (c Config) WithEntry(name string) (Config, bool) {
+	entry, ok := c.LookupEntry(name)
+	if !ok {
+		return Config{}, false
+	}
+	scoped := c.Normalize()
+	scoped.VirtualModel = entry.Name
+	scoped.Strategy = entry.Strategy
+	scoped.Preference = entry.Preference
+	scoped.Cache = entry.Cache
+	scoped.ExecutorFallback = entry.ExecutorFallback
+	scoped.Classifier = entry.Classifier
+	scoped.Routing = entry.Routing
+	scoped.Routes = entry.Routes
+	scoped.Models = entry.Models
+	return scoped, true
+}
+
+// VirtualModelNames returns every routable virtual model name in config order.
+func (c Config) VirtualModelNames() []string {
+	entries := c.ResolveEntries()
+	out := make([]string, 0, len(entries))
+	for _, entry := range entries {
+		out = append(out, entry.Name)
+	}
+	return out
+}
+
+// cloneStrings copies a string slice so normalization never mutates shared backing arrays.
+func cloneStrings(in []string) []string {
+	if in == nil {
+		return nil
+	}
+	out := make([]string, len(in))
+	copy(out, in)
+	return out
+}
+
+// cloneCandidateConfigs deep-copies candidates (including capability lists).
+func cloneCandidateConfigs(in []CandidateConfig) []CandidateConfig {
+	if in == nil {
+		return nil
+	}
+	out := make([]CandidateConfig, len(in))
+	copy(out, in)
+	for i := range out {
+		out[i].Capabilities = cloneStrings(in[i].Capabilities)
+	}
+	return out
+}
+
+// cloneAny recursively copies YAML-compatible maps and slices.
+func cloneAny(value any) any {
+	switch typed := value.(type) {
+	case map[string]any:
+		out := make(map[string]any, len(typed))
+		for key, item := range typed {
+			out[key] = cloneAny(item)
+		}
+		return out
+	case map[string]string:
+		out := make(map[string]string, len(typed))
+		for key, item := range typed {
+			out[key] = item
+		}
+		return out
+	case []any:
+		out := make([]any, len(typed))
+		for i, item := range typed {
+			out[i] = cloneAny(item)
+		}
+		return out
+	case []string:
+		return cloneStrings(typed)
+	default:
+		return value
+	}
+}
+
+// cloneClassifierModels copies the ordered classifier targets, including
+// their header and request-override maps, so normalization never shares
+// mutable values.
+func cloneClassifierModels(in []ClassifierModel) []ClassifierModel {
+	if in == nil {
+		return nil
+	}
+	out := make([]ClassifierModel, len(in))
+	copy(out, in)
+	for i := range out {
+		if in[i].Headers != nil {
+			out[i].Headers = make(map[string]string, len(in[i].Headers))
+			for k, v := range in[i].Headers {
+				out[i].Headers[k] = v
+			}
+		}
+		if in[i].RequestOverrides != nil {
+			out[i].RequestOverrides = cloneAny(in[i].RequestOverrides).(map[string]any)
+		}
+	}
+	return out
+}
+
+// cloneRoutes copies route rules. Condition scalar pointers are read-only
+// during normalization and routing, so sharing them is safe.
+func cloneRoutes(in []RouteRule) []RouteRule {
+	if in == nil {
+		return nil
+	}
+	out := make([]RouteRule, len(in))
+	copy(out, in)
+	return out
+}
+
+// cloneEntries deep-copies virtual model entries with their nested slices.
+func cloneEntries(in []VirtualModelEntry) []VirtualModelEntry {
+	if in == nil {
+		return nil
+	}
+	out := make([]VirtualModelEntry, len(in))
+	copy(out, in)
+	for i := range out {
+		out[i].Models = cloneCandidateConfigs(in[i].Models)
+		out[i].Routes = cloneRoutes(in[i].Routes)
+		out[i].Classifier.Models = cloneClassifierModels(in[i].Classifier.Models)
+	}
+	return out
+}
+
+// EffectiveCacheMaxEntries returns the route-cache capacity for the shared
+// global cache map: the largest max_entries among cache-enabled entries.
+// The map is shared across entries (keys already include the requested model),
+// so per-entry values cannot partition it; using the max keeps a small entry
+// from evicting every other entry's routes.
+func (c Config) EffectiveCacheMaxEntries() int {
+	max := 0
+	for _, entry := range c.ResolveEntries() {
+		if entry.Cache.Enabled && entry.Cache.MaxEntries > max {
+			max = entry.Cache.MaxEntries
+		}
+	}
+	if max <= 0 {
+		return 1024
+	}
+	return max
+}
+
 // Normalize fills defaults and trims user-provided strings.
+// It deep-copies every slice first: ConfigStore holds one shared Config value
+// and Load hands out shallow copies, so in-place normalization would race on
+// the shared backing arrays under concurrent multi-model requests.
 func (c Config) Normalize() Config {
+	c.Models = cloneCandidateConfigs(c.Models)
+	c.Routes = cloneRoutes(c.Routes)
+	c.Classifier.Models = cloneClassifierModels(c.Classifier.Models)
+	c.VirtualModels = cloneEntries(c.VirtualModels)
 	if strings.TrimSpace(c.VirtualModel) == "" {
 		c.VirtualModel = DefaultVirtualModel
 	}
@@ -174,12 +492,7 @@ func (c Config) Normalize() Config {
 	}
 	c.VirtualModel = strings.TrimSpace(c.VirtualModel)
 	c.Strategy = strings.ToLower(strings.TrimSpace(c.Strategy))
-	c.Preference = strings.ToLower(strings.TrimSpace(c.Preference))
-	switch c.Preference {
-	case PreferenceCost, PreferenceBalanced, PreferenceQuality:
-	default:
-		c.Preference = DefaultPreference
-	}
+	c.Preference = normalizePreference(c.Preference)
 	c.StatePath = strings.TrimSpace(c.StatePath)
 	c.Debug.LogPath = strings.TrimSpace(c.Debug.LogPath)
 	c.Catalog.Source = strings.TrimSpace(c.Catalog.Source)
@@ -188,32 +501,110 @@ func (c Config) Normalize() Config {
 	c.Catalog.RefreshInterval = strings.TrimSpace(c.Catalog.RefreshInterval)
 	c.Pricing.URL = strings.TrimSpace(c.Pricing.URL)
 	c.Pricing.RefreshInterval = strings.TrimSpace(c.Pricing.RefreshInterval)
-	if c.Cache.MaxEntries <= 0 {
-		c.Cache.MaxEntries = 1024
+	normalizeCache(&c.Cache)
+	normalizeExecutorFallback(&c.ExecutorFallback)
+	normalizeClassifier(&c.Classifier)
+	normalizeCandidates(c.Models)
+	normalizeRoutes(c.Routes)
+	for i := range c.VirtualModels {
+		entry := &c.VirtualModels[i]
+		entry.Name = strings.TrimSpace(entry.Name)
+		if strings.TrimSpace(entry.Strategy) == "" {
+			entry.Strategy = DefaultStrategy
+		}
+		entry.Strategy = strings.ToLower(strings.TrimSpace(entry.Strategy))
+		entry.Preference = normalizePreference(entry.Preference)
+		normalizeCache(&entry.Cache)
+		normalizeExecutorFallback(&entry.ExecutorFallback)
+		normalizeClassifier(&entry.Classifier)
+		normalizeCandidates(entry.Models)
+		normalizeRoutes(entry.Routes)
 	}
-	c.Cache.TTL = strings.TrimSpace(c.Cache.TTL)
-	if c.ExecutorFallback.MaxAttempts <= 0 {
-		c.ExecutorFallback.MaxAttempts = 3
+	kept := c.VirtualModels[:0]
+	for _, entry := range c.VirtualModels {
+		if entry.Name != "" {
+			kept = append(kept, entry)
+		}
 	}
-	c.Classifier.Timeout = strings.TrimSpace(c.Classifier.Timeout)
-	for i := range c.Classifier.Models {
-		c.Classifier.Models[i].Provider = strings.ToLower(strings.TrimSpace(c.Classifier.Models[i].Provider))
-		c.Classifier.Models[i].Model = strings.TrimSpace(c.Classifier.Models[i].Model)
-	}
-	for i := range c.Models {
-		c.Models[i].Provider = strings.ToLower(strings.TrimSpace(c.Models[i].Provider))
-		c.Models[i].Model = strings.TrimSpace(c.Models[i].Model)
-		c.Models[i].Cost = strings.ToLower(strings.TrimSpace(c.Models[i].Cost))
-		c.Models[i].Quality = strings.ToLower(strings.TrimSpace(c.Models[i].Quality))
-	}
-	for i := range c.Routes {
-		c.Routes[i].Model = strings.TrimSpace(c.Routes[i].Model)
-		c.Routes[i].Provider = strings.ToLower(strings.TrimSpace(c.Routes[i].Provider))
-		c.Routes[i].When.Task = strings.ToLower(strings.TrimSpace(c.Routes[i].When.Task))
-		c.Routes[i].When.Language = strings.ToLower(strings.TrimSpace(c.Routes[i].When.Language))
-		c.Routes[i].When.Complexity = strings.ToLower(strings.TrimSpace(c.Routes[i].When.Complexity))
-	}
+	c.VirtualModels = kept
 	return c
+}
+
+// normalizePreference lowercases the preference and falls back to balanced.
+func normalizePreference(value string) string {
+	switch strings.ToLower(strings.TrimSpace(value)) {
+	case PreferenceCost, PreferenceBalanced, PreferenceQuality:
+		return strings.ToLower(strings.TrimSpace(value))
+	default:
+		return DefaultPreference
+	}
+}
+
+// normalizeCache applies the cache entry-count default and trims the TTL.
+func normalizeCache(cache *CacheConfig) {
+	if cache.MaxEntries <= 0 {
+		cache.MaxEntries = 1024
+	}
+	cache.TTL = strings.TrimSpace(cache.TTL)
+}
+
+// normalizeExecutorFallback applies the max-attempts default.
+func normalizeExecutorFallback(fallback *ExecutorFallbackConfig) {
+	if fallback.MaxAttempts <= 0 {
+		fallback.MaxAttempts = 3
+	}
+}
+
+// normalizeClassifier trims classifier fields, candidate references, and
+// header names/values. Empty header names or values are dropped.
+func normalizeClassifier(classifier *ClassifierConfig) {
+	classifier.Timeout = strings.TrimSpace(classifier.Timeout)
+	if classifier.MaxTokens <= 0 {
+		classifier.MaxTokens = DefaultClassifierMaxTokens
+	}
+	for i := range classifier.Models {
+		classifier.Models[i].Provider = strings.ToLower(strings.TrimSpace(classifier.Models[i].Provider))
+		classifier.Models[i].Model = strings.TrimSpace(classifier.Models[i].Model)
+		if len(classifier.Models[i].Headers) > 0 {
+			cleaned := make(map[string]string, len(classifier.Models[i].Headers))
+			for k, v := range classifier.Models[i].Headers {
+				k = strings.TrimSpace(k)
+				v = strings.TrimSpace(v)
+				if k != "" && v != "" {
+					cleaned[k] = v
+				}
+			}
+			classifier.Models[i].Headers = cleaned
+		}
+	}
+	kept := classifier.Models[:0]
+	for _, model := range classifier.Models {
+		if model.Model != "" {
+			kept = append(kept, model)
+		}
+	}
+	classifier.Models = kept
+}
+
+// normalizeCandidates trims provider/model/cost/quality per candidate.
+func normalizeCandidates(models []CandidateConfig) {
+	for i := range models {
+		models[i].Provider = strings.ToLower(strings.TrimSpace(models[i].Provider))
+		models[i].Model = strings.TrimSpace(models[i].Model)
+		models[i].Cost = strings.ToLower(strings.TrimSpace(models[i].Cost))
+		models[i].Quality = strings.ToLower(strings.TrimSpace(models[i].Quality))
+	}
+}
+
+// normalizeRoutes trims rule targets and match conditions.
+func normalizeRoutes(routes []RouteRule) {
+	for i := range routes {
+		routes[i].Model = strings.TrimSpace(routes[i].Model)
+		routes[i].Provider = strings.ToLower(strings.TrimSpace(routes[i].Provider))
+		routes[i].When.Task = strings.ToLower(strings.TrimSpace(routes[i].When.Task))
+		routes[i].When.Language = strings.ToLower(strings.TrimSpace(routes[i].When.Language))
+		routes[i].When.Complexity = strings.ToLower(strings.TrimSpace(routes[i].When.Complexity))
+	}
 }
 
 // EnabledForRouting reports whether the plugin should handle route requests.

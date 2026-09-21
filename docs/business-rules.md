@@ -181,26 +181,32 @@ The classifier receives:
 - current `preference`
 - extracted last user message
 
-The classifier is expected to return compact JSON:
+The classifier request carries `max_tokens` from `classifier.max_tokens` (default `500` when unset; the current intended deployment uses `1000`), per-model `headers` forwarded verbatim, and per-model `request_overrides` (a generic YAML map for provider-specific options) merged underneath routing invariants. `model`, `messages`, `stream`, `temperature`, and `max_tokens` always win over conflicting overrides. `classifier.timeout` is parsed but cannot be enforced because `host.model.execute` is synchronous and non-cancellable.
+
+The routing prompt treats the catalog and user text as untrusted data and asks only for the compact verdict:
 
 ```json
-{"selected_model":"<id>","confidence":0.9,"reason":"short reason"}
+{"selected_model":"<exact-id>"}
 ```
+
+No reason or confidence is requested. Legacy responses carrying extra fields are still accepted; only `selected_model` is read.
 
 ## Classifier Failure Rule
 
+Verdict parsing must search `content`, `reasoning_content`, `reasoning`, then the raw body when appropriate, scanning every balanced JSON object in each source. The first object naming an exact configured model whose provider is available wins. Unknown selections are skipped so a later valid verdict can still win; unavailable selections are recorded separately.
+
 Classifier output must be rejected when:
 
-- the host callback fails
-- the classifier response is non-2xx
-- the classifier response is not valid JSON or does not contain a JSON object
-- `selected_model` is empty
-- `selected_model` is not present in configured `models`
-- selected provider is unavailable
+- the host callback fails (`transport_error`)
+- the classifier response is non-2xx (`http_error`)
+- no scanned source contains a usable verdict (`invalid_verdict`)
+- every named model is unknown, or every known model has an unavailable provider (`invalid_verdict` / `unavailable_selection`)
 
 If one classifier attempt fails, the next configured classifier may be tried.
 
 If all classifier attempts fail, deterministic fallback must be used.
+
+The classifier trace must carry only structured attempt outcomes (outcome, HTTP status, latency, verdict source, selected model, totals); it must never log raw classifier responses or error text. A successful classifier route must carry `Reason: "classifier:<classifier-model-id>"`, not classifier-supplied prose.
 
 ## Last User Message Rule
 
@@ -351,7 +357,7 @@ Logs may include:
 - preference
 - target provider/model
 - reason
-- classifier trace
+- classifier trace (structured attempt outcomes only; never raw classifier responses or error text)
 - decision trace (for `decision_engine`: task, language, complexity score, matched policy, decision time)
 
 Logs must not include:
@@ -420,7 +426,7 @@ The plugin exposes a management status route:
 GET /plugins/smart-model-router/status
 ```
 
-It reports non-sensitive status, usage snapshots, and runtime state snapshots.
+It reports non-sensitive status, usage snapshots, and runtime state snapshots, including a per-virtual-model classifier summary (enabled flag, models, max attempts, max tokens; headers and overrides excluded).
 
 ## Safety Rule
 

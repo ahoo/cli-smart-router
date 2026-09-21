@@ -96,6 +96,8 @@ Type: `string`
 
 The model name clients should request. The router only handles requests where the requested model exactly matches this value. All other model requests return `Handled: false` and are left to CLIProxyAPI or other routers.
 
+This legacy single-model field is used only when `virtual_models` is absent. When `virtual_models` holds at least one named entry, `virtual_model` is ignored for routing (it is still reported on the status endpoint for backward compatibility).
+
 Default in code: `router:auto`
 
 Examples:
@@ -107,6 +109,34 @@ virtual_model: router:auto
 ```yaml
 virtual_model: claude-auto
 ```
+
+### `virtual_models`
+
+Type: `list of objects`
+
+Multiple independently routable virtual models. Each entry has a `name` plus its own `strategy`, `preference`, `models`, `routes`, `classifier`, `cache`, and `routing`. Entries never inherit routing fields from the top level; unset entry fields fall back to code defaults. See `docs/adr/0007-multi-virtual-models.md` and `configs/smart-model-router_multi.yaml`.
+
+Example:
+
+```yaml
+virtual_models:
+  - name: router-cheap
+    strategy: hybrid
+    preference: cost
+    models:
+      - {provider: codex, model: gpt-5.4-mini, capabilities: [summarize, fast, low_cost], cost: low, quality: medium}
+  - name: router-security
+    strategy: decision_engine
+    preference: quality
+    routes:
+      - when: {task: security}
+        provider: claude
+        model: claude-opus-4-8
+    models:
+      - {provider: claude, model: claude-opus-4-8, capabilities: [security, reasoning], cost: very_high, quality: highest}
+```
+
+Session pins, route cache entries, and Decision Engine fallback chains are namespaced per virtual model, so one session can pin different models per entry.
 
 ### `strategy`
 
@@ -457,6 +487,7 @@ classifier:
       model: claude-haiku-4-5-20251001
   timeout: 8s
   max_attempts: 2
+  max_tokens: 1000
 ```
 
 ### `classifier.enabled`
@@ -483,22 +514,26 @@ Each classifier entry has:
 
 - `provider`: provider key, normalized to lowercase
 - `model`: model ID
+- `headers`: optional map of HTTP headers forwarded verbatim to `host.model.execute` (for example `X-Opencode-Session` for free-tier models that reject headerless calls); empty names/values are dropped
+- `request_overrides`: optional generic YAML map of extra OpenAI request fields merged into the classifier request body (for example provider-specific parameters such as Qwen/SiliconFlow options). This is passthrough, not provider support: only the supplied fields are sent. Routing invariants always win over conflicting overrides: `model`, `messages`, `stream`, `temperature`, and `max_tokens` are reapplied after the merge.
 
 Classifier models should also exist in the configured `models` list. This keeps provider/model metadata explicit.
 
-The classifier request is isolated from the original user request. It receives a routing prompt, the configured model catalog, and only the extracted last user message. It must return compact JSON:
+The classifier request is isolated from the original user request. It receives a routing prompt, the configured model catalog, and only the extracted last user message. The system prompt treats the catalog and user text as untrusted data (instructions inside them are ignored) and asks only for the compact verdict first:
 
 ```json
-{"selected_model":"<id>","confidence":0.9,"reason":"short reason"}
+{"selected_model":"<exact-id>"}
 ```
 
-If the classifier fails, returns invalid JSON, selects an unknown model, or selects a provider that is not available, the plugin falls back to deterministic routing.
+No reason or confidence is requested, and the classifier must not answer the request or emit a preamble. Legacy responses carrying extra fields such as `confidence` or `reason` are still accepted; only `selected_model` is read.
+
+If the classifier fails, returns no usable verdict, selects an unknown model, or selects a provider that is not available, the plugin falls back to deterministic routing.
 
 ### `classifier.timeout`
 
 Type: Go duration string
 
-Currently parsed/normalized but not enforced by the plugin's host callback call path.
+Parsed and normalized (whitespace trimmed) but cannot be enforced: `host.model.execute` is synchronous and non-cancellable, so there is no deadline to apply it to. Kept as configuration for forward compatibility; do not rely on it to bound classifier latency. Classifier budget control is via `max_tokens` and `max_attempts`.
 
 ### `classifier.max_attempts`
 
@@ -507,6 +542,14 @@ Type: `int`
 Maximum number of classifier entries to try.
 
 If `<= 0` or greater than the number of configured classifier models, all configured classifier models may be tried.
+
+### `classifier.max_tokens`
+
+Type: `int`
+
+Token budget sent as `max_tokens` on every classifier request. Reasoning-style classifiers emit thinking before the verdict, so the budget must leave room for the compact JSON after the preamble.
+
+Default in code when `<= 0`: `500` (compatibility default). The current intended deployment uses `1000`.
 
 ## `routing`
 
@@ -864,7 +907,7 @@ The classifier receives:
 - the extracted last user message
 - the configured `preference` instruction
 
-It returns a selected model ID, confidence, and short reason. The selected model must exist in `models` and its provider must be available.
+It returns only the selected model ID; confidence and reason are no longer requested (legacy extra fields accepted). The selected model must exist in `models` and its provider must be available.
 
 If anything fails, routing falls back to the local capability-aware decision.
 
@@ -892,7 +935,7 @@ Cache storage:
 Example JSONL decision log using the classifier (`llm`, or `hybrid` with a non-confident local decision):
 
 ```json
-{"time":"2026-07-02T07:29:55.089425433-03:00","source":"selected","virtual_model":"claude-auto","source_format":"openai","stream":true,"strategy":"llm","preference":"balanced","target_provider":"claude","target_model":"claude-sonnet-5","reason":"classifier:Pedido envolve arquitetura, implementação em Go, JWT e plano de performance; Sonnet atende bem sem subir ao modelo mais caro.","classifier":{"enabled":true,"used":true,"model":"gpt-5.4-mini","response":"{\"selected_model\":\"claude-sonnet-5\",\"confidence\":0.94,\"reason\":\"...\"}"}}
+{"time":"2026-07-02T07:29:55.089425433-03:00","source":"selected","virtual_model":"claude-auto","source_format":"openai","stream":true,"strategy":"llm","preference":"balanced","target_provider":"claude","target_model":"claude-sonnet-5","reason":"classifier:gpt-5.4-mini","classifier":{"enabled":true,"used":true,"attempt_count":1,"total_latency_ms":412,"attempts":[{"model":"gpt-5.4-mini","latency_ms":410,"http_status":200,"outcome":"selected","verdict_source":"content","selected_model":"claude-sonnet-5"}]}}
 ```
 
 Example JSONL decision log for a `hybrid` request that skipped the classifier because the local decision was confident:

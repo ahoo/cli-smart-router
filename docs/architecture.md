@@ -398,22 +398,25 @@ The classifier call uses `host.model.execute` and sends an isolated routing prom
 - the extracted last user message
 - the configured `preference` instruction
 
-The classifier must return compact JSON with:
+The classifier request body starts from the per-model `request_overrides` map (generic passthrough for provider-specific options), then reapplies invariants `model`, `messages`, `stream: false`, `temperature: 0`, and `max_tokens` (`classifier.max_tokens`, default `500` when unset). Per-model `headers` are forwarded verbatim to `host.model.execute`. The system prompt treats the catalog and user text as untrusted data and asks only for the compact verdict first:
 
 ```json
-{"selected_model":"<id>","confidence":0.9,"reason":"short reason"}
+{"selected_model":"<exact-id>"}
 ```
+
+No reason or confidence is requested (legacy extra fields are still accepted; only `selected_model` is read). `classifier.timeout` is parsed but cannot be enforced because `host.model.execute` is synchronous and non-cancellable.
+
+Verdict parsing searches `content`, `reasoning_content`, `reasoning`, then the raw body when appropriate. Each source is scanned for every balanced JSON object (an unfinished object never blocks a later valid one), and the first object naming an exact configured model whose provider is available wins. Unknown or unavailable selections are skipped so a later valid verdict can still win; when none is found the failure is categorized as `invalid_verdict` or `unavailable_selection`. Transport and HTTP failures are recorded as `transport_error` / `http_error`.
 
 Classifier failure cases:
 
-- host call error
-- non-2xx model execution response
-- invalid JSON
-- empty `selected_model`
-- selected model not found in configured `models`
-- selected model provider unavailable
+- host call error (`transport_error`)
+- non-2xx model execution response (`http_error`)
+- no usable verdict in any scanned source (`invalid_verdict`)
+- selected model not found in configured `models` (skipped; `invalid_verdict` if nothing else matches)
+- selected model provider unavailable (`unavailable_selection`)
 
-On failure, the next classifier is tried. If all attempts fail, the local deterministic decision computed in step 3 is used.
+On failure, the next classifier is tried. If all attempts fail, the trace-level `error` keeps the last attempt's outcome; `attempts_exhausted` is reserved for a configuration with no usable non-empty attempt, and `no_models` means none are configured. The local deterministic decision computed in step 3 is then used. A successful route carries `Reason: "classifier:<classifier-model-id>"`.
 
 ### 6. Preference Tiebreak
 
@@ -594,13 +597,12 @@ Possible `source` values:
 
 When `strategy: hybrid` uses the local confident decision instead of calling the classifier, `source` is still `selected`, and `reason` is prefixed with `local_confident` so decision logs distinguish it from a classifier or plain deterministic-fallback selection.
 
-Classifier trace may include:
+The classifier trace is structured and never carries raw classifier responses or error text. It includes:
 
-- whether classifier was enabled
-- whether classifier was used
-- classifier model used
-- raw classifier response
-- classifier error
+- whether the classifier was enabled / used
+- `attempt_count` and `total_latency_ms`
+- per-attempt `provider`, `model`, `latency_ms`, `http_status`, `outcome` (`selected`, `transport_error`, `http_error`, `invalid_verdict`, `unavailable_selection`), plus `verdict_source` (`content`, `reasoning_content`, `reasoning`, `body`) and `selected_model` on success
+- a coarse `error` category only (for example `no_models`, an outcome name, or `attempts_exhausted`)
 
 Debug logs intentionally omit prompts and request/response bodies.
 
@@ -617,6 +619,7 @@ The status response includes:
 - plugin identifier
 - virtual model
 - strategy
+- `virtual_model_status`: per-virtual-model effective classifier summary (enabled flag, models, max attempts, max tokens; headers and overrides excluded)
 - usage snapshot
 - runtime state snapshot
 - `last_decision`: the last Decision Engine outcome (task, language, score, matched policy, provider, model, reason, matched flag, decision time in microseconds), when `strategy: decision_engine` has run. It contains only non-sensitive routing metadata.

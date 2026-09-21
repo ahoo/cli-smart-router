@@ -54,8 +54,8 @@ internal/infrastructure/
 - Do not add interfaces with one implementation unless they protect the domain/application layer from ABI or host-callback details.
 - Prefer deterministic routing as the fallback path for every advanced feature.
 - Do not log prompts, request bodies, credentials, API keys, auth records, or response bodies.
-- `virtual_model` must remain configurable. Default is `router:auto`.
-- `model.route` must return `Handled: false` for every model that is not the configured `virtual_model`.
+- `virtual_model` / `virtual_models` must remain configurable. Default is `router:auto`.
+- `model.route` must return `Handled: false` for every model that is not a configured virtual model.
 - V1 uses local minimal CLIProxyAPI contract structs because this workspace has Go 1.22 and the local CLIProxyAPI SDK requires Go 1.26.
 - Revisit direct SDK imports only when the project toolchain is Go 1.26 or newer.
 - When adding a new feature, behavior, architectural decision, or resolving an important implementation doubt, create a new incremental ADR in `docs/adr/`.

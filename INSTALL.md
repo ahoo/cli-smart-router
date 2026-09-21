@@ -137,8 +137,9 @@ plugins:
             model: gpt-5.4-mini
           - provider: claude
             model: claude-haiku-4-5-20251001
-        timeout: 8s
+        timeout: 8s # parsed but not enforceable (sync host call); see docs/configuration.md
         max_attempts: 2
+        max_tokens: 1000
       models:
         - provider: codex
           model: gpt-5.4-mini
@@ -212,7 +213,7 @@ OpenAI-compatible example:
 }
 ```
 
-The plugin routes the request to a configured candidate whose provider is available in CLIProxyAPI. With `strategy: llm` or `strategy: hybrid`, the classifier can select among configured candidates using an isolated routing prompt; invalid or failed classifier output falls back to deterministic routing.
+The plugin routes the request to a configured candidate whose provider is available in CLIProxyAPI. With `strategy: llm` or `strategy: hybrid`, the classifier can select among configured candidates using an isolated routing prompt that asks only for `{"selected_model":"<exact-id>"}`; unknown, unavailable, or unparsable verdicts fall back to deterministic routing. Provider-specific classifier options (for example Qwen/SiliconFlow parameters) go in per-model `request_overrides`; see `docs/configuration.md`.
 
 `preference` controls the cost/quality bias:
 

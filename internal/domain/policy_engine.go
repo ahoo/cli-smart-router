@@ -16,6 +16,11 @@ type RouteFacts struct {
 	FileCount       int
 	HasDiff         bool
 	Stream          bool
+	// PromptTemplate is the detected request shape ("" = unrecognized), e.g.
+	// bounded_output for harness micro-tasks or continuation for bare "continue".
+	PromptTemplate string
+	// PromptBoundsOutput reports whether the prompt sizes its own answer.
+	PromptBoundsOutput bool
 }
 
 // PolicyDecision is the Policy Engine output. Matched reports whether a rule fired;
@@ -82,6 +87,14 @@ var conditions = []condition{
 	{
 		active: func(c RouteCondition) bool { return c.Stream != nil },
 		match:  func(c RouteCondition, f RouteFacts) bool { return *c.Stream == f.Stream },
+	},
+	{
+		active: func(c RouteCondition) bool { return c.PromptTemplate != "" },
+		match:  func(c RouteCondition, f RouteFacts) bool { return c.PromptTemplate == f.PromptTemplate },
+	},
+	{
+		active: func(c RouteCondition) bool { return c.MaxOutputHint != nil },
+		match:  func(c RouteCondition, f RouteFacts) bool { return *c.MaxOutputHint == f.PromptBoundsOutput },
 	},
 }
 
@@ -235,6 +248,8 @@ func ruleReason(when RouteCondition, facts RouteFacts) string {
 	appendPart(when.MinFiles != nil, "min_files")
 	appendPart(when.HasDiff != nil, "has_diff")
 	appendPart(when.Stream != nil, "stream")
+	appendPart(when.PromptTemplate != "", "prompt_template="+when.PromptTemplate)
+	appendPart(when.MaxOutputHint != nil, "max_output_hint")
 	if len(parts) == 0 {
 		return "rule:catch_all"
 	}
