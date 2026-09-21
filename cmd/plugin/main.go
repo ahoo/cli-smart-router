@@ -407,7 +407,9 @@ func routingTask(req infrastructure.ModelRouteRequest, prompt string) domain.Int
 	if task := routingTaskOverride(req, prompt); task.Valid() {
 		return task
 	}
-	return domain.DetectIntent(prompt)
+	// Distilled student first (local, instant, no egress); legacy keyword
+	// detection remains the fallback when the student abstains or errors.
+	return domain.DetectIntentSmart(prompt)
 }
 
 func routingTaskOverride(req infrastructure.ModelRouteRequest, prompt string) domain.Intent {
@@ -1205,7 +1207,7 @@ func pluginRegistration() registration {
 		SchemaVersion: infrastructure.SchemaVersion,
 		Metadata: infrastructure.Metadata{
 			Name:             pluginIdentifier,
-			Version:          "0.2.2",
+			Version:          "0.2.3",
 			Author:           "Victor Feitoza",
 			GitHubRepository: "https://github.com/vfeitoza/cli-smart-router",
 			ConfigFields: []infrastructure.ConfigField{

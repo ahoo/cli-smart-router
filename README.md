@@ -77,12 +77,17 @@ The local decision infers capability tags from the extracted last user message (
 
 OpenCode subagents can declare a routing phase. A valid `X-Router-Task` header
 (`planning`, `coding`, `review`, `testing`, `debug`, `security`,
-`documentation`, or `performance`) overrides lexical intent detection. When no
+`documentation`, or `performance`) overrides intent detection. When no
 valid task header is present, the router accepts `X-Router-Agent` values
 `planner`, `implementer`, and `reviewer`; it then checks matching
 `[router-task: ...]` and `[router-agent: ...]` tags in the last user message.
 This keeps an implementer on a code route even when its attached plan mentions
 architecture or roadmap work.
+
+Without an override, task detection runs the distilled intent student first
+(local TF-IDF + logistic regression, no egress) and falls back to legacy
+lexical keyword detection when the student abstains or errors. See
+`docs/adr/0009-distilled-intent-model.md`.
 
 The classifier, when called, receives an isolated routing prompt with the configured model catalog and the extracted last user message. The prompt asks only for `{"selected_model":"<exact-id>"}`, treats the catalog and user text as untrusted data, and requests no reason or confidence (legacy extra fields are still accepted). Verdict parsing scans `content`, `reasoning_content`, and `reasoning` (or the raw body when no usable OpenAI message field exists) for the first exact configured-and-available model; anything else falls back to the local deterministic decision. Per-model `headers` are forwarded verbatim and `request_overrides` supplies extra provider options, while `model`/`messages`/`stream`/`temperature`/`max_tokens` always win. See `docs/configuration.md`.
 
